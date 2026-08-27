@@ -1,0 +1,19 @@
+# pi5-nas deploy. Run from ~/docker/lfc-ticker/ on that host:
+#   docker compose -f docker-compose.pi5-nas.yml up -d --build
+#
+# Not the local dev compose file (see docker-compose.yml for that) — this
+# one uses the real bind-mount path convention every other service under
+# ~/docker/ on this box uses (relative to this file's own directory, not
+# the Docker data-root at /mnt/data/docker), an always-on restart policy,
+# and PUID/PGID for this host's actual mike:users (1000:100), not Bilbo's
+# coincidental 1000:1000.
+services:
+  ticker:
+    build: .
+    container_name: lfc-ticker
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data

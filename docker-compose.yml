@@ -1,9 +1,10 @@
-# Local dev/test only. A separate pi5-nas-specific compose file (UID/GID
-# mapping, the real bind-mount path under ~/docker/lfc-ticker/, etc.) comes
-# in the deploy stage.
+# Local dev/test only. See docker-compose.pi5-nas.yml for the real deploy
+# (PUID/PGID for the actual host user, restart policy, the real bind-mount
+# path under ~/docker/lfc-ticker/).
 services:
   ticker:
     build: .
+    user: "${PUID:-1000}:${PGID:-1000}"
     env_file:
       - .env
     volumes:
