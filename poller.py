@@ -1,9 +1,10 @@
-"""team-ticker poller — Stage 1.
+"""team-ticker poller.
 
 Fetches the configured team's current fixture status from ESPN's
 (unofficial) soccer scoreboard API, determines whether a match is live,
 upcoming/just-finished today ("matchday"), or there's no match today
-("idle"), and writes the result to ticker.json.
+("idle"), and writes the result to ticker.json. Idle mode also fills in
+next fixture, a league table slice, and BBC Sport headlines.
 
 Which team/league to track is configured via the TEAM_ID and LEAGUE
 environment variables (see .env.example) — this module has no team baked in.
@@ -11,8 +12,12 @@ The defaults (364 / eng.1, i.e. Liverpool / English Premier League) are just
 the reference instance this project was built against, not the only
 supported team.
 
-Run once: `python poller.py`. No scheduling loop yet — that's added later
-when this moves into a container.
+By default this runs as a long-lived loop (the container's main process),
+polling at an interval that depends on the mode just written — see
+POLL_INTERVAL_BY_MODE. Pass --once (or set RUN_ONCE=true) for a single
+fetch-detect-write cycle that exits immediately, useful for local testing.
+SIGTERM/SIGINT (e.g. `docker stop`) trigger a clean shutdown rather than
+waiting out the current sleep.
 """
 
 from __future__ import annotations
@@ -20,7 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,9 +70,32 @@ HEADLINES_LIMIT = 5
 
 USER_AGENT = "team-ticker-poller/0.1 (+https://github.com/mikelawton/team-ticker)"
 
-TICKER_JSON_PATH = "ticker.json"
+# Local default; containers override via the TICKER_JSON_PATH env var to
+# point at a volume-mounted path (e.g. /data/ticker.json) instead of baking
+# the output into the image filesystem.
+DEFAULT_TICKER_JSON_PATH = "ticker.json"
 
 REQUEST_TIMEOUT_SECONDS = 10
+
+# Poll interval after a cycle lands on each mode — matches ESPN data's
+# actual update cadence: live scores move fast, a scheduled/finished match
+# doesn't change for a while, and idle (table/headlines) changes slower still.
+POLL_INTERVAL_LIVE = 60
+POLL_INTERVAL_MATCHDAY = 300
+POLL_INTERVAL_IDLE = 900
+
+POLL_INTERVAL_BY_MODE = {
+    "live": POLL_INTERVAL_LIVE,
+    "matchday": POLL_INTERVAL_MATCHDAY,
+    "idle": POLL_INTERVAL_IDLE,
+}
+
+# Backoff after a cycle raises unexpectedly (vs. the fetch functions' own
+# None-on-failure handling, which doesn't raise): starts short, doubles each
+# consecutive failure, capped at the idle interval so a persistently broken
+# dependency doesn't get hammered in a tight loop.
+INITIAL_BACKOFF_SECONDS = 10
+MAX_BACKOFF_SECONDS = POLL_INTERVAL_IDLE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +115,7 @@ class Config:
     league: str
     scoreboard_url: str
     standings_url: str
+    ticker_json_path: str
 
 
 def load_config() -> Config:
@@ -118,6 +149,9 @@ def load_config() -> Config:
         league=league,
         scoreboard_url=SCOREBOARD_URL_TEMPLATE.format(league=league),
         standings_url=STANDINGS_URL_TEMPLATE.format(league=league),
+        ticker_json_path=os.environ.get(
+            "TICKER_JSON_PATH", DEFAULT_TICKER_JSON_PATH
+        ).strip(),
     )
 
 
@@ -535,7 +569,10 @@ def build_ticker_document(mode_result: dict) -> dict:
     return document
 
 
-def write_ticker_json(document: dict, path: str = TICKER_JSON_PATH) -> None:
+def write_ticker_json(document: dict, path: str = DEFAULT_TICKER_JSON_PATH) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(document, f, indent=2)
     log.info("wrote %s (mode=%s)", path, document.get("mode"))
@@ -545,12 +582,23 @@ def write_ticker_json(document: dict, path: str = TICKER_JSON_PATH) -> None:
 # Entry point
 # --------------------------------------------------------------------------
 
+# Set by the SIGTERM/SIGINT handler; the loop's sleep is an Event.wait() on
+# this so shutdown is immediate rather than waiting out a long poll interval.
+_shutdown_event = threading.Event()
 
-def run() -> dict:
-    config = load_config()
-    log.info("configured for team_id=%s league=%s", config.team_id, config.league)
 
-    session = make_session()
+def _handle_shutdown_signal(signum: int, frame: Any) -> None:
+    log.info("received signal %s, shutting down after this cycle", signal.Signals(signum).name)
+    _shutdown_event.set()
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+
+def run_once(session: requests.Session, config: Config) -> dict:
+    """A single fetch-detect-write cycle."""
     scoreboard_data = fetch_scoreboard(session, config.scoreboard_url)
 
     mode_result = determine_mode(scoreboard_data, team_id=config.team_id)
@@ -572,9 +620,63 @@ def run() -> dict:
     log.info("mode determined: %s", mode_result["mode"])
 
     document = build_ticker_document(mode_result)
-    write_ticker_json(document)
+    write_ticker_json(document, path=config.ticker_json_path)
     return document
 
 
+def run() -> dict:
+    """Load config and run a single fetch-detect-write cycle, then return.
+
+    Used by --once / RUN_ONCE=true, and for local testing/debugging without
+    waiting on the loop.
+    """
+    config = load_config()
+    log.info("configured for team_id=%s league=%s", config.team_id, config.league)
+    session = make_session()
+    return run_once(session, config)
+
+
+def run_loop() -> None:
+    """Long-running loop: the container's main process.
+
+    Polls at an interval depending on the mode just written (see
+    POLL_INTERVAL_BY_MODE). A cycle that raises unexpectedly is logged and
+    retried after a backoff (capped at the idle interval) rather than
+    crashing the process or hammering the API. SIGTERM/SIGINT interrupt the
+    sleep immediately for a clean shutdown.
+    """
+    config = load_config()
+    log.info("configured for team_id=%s league=%s", config.team_id, config.league)
+    install_signal_handlers()
+
+    session = make_session()
+    backoff = INITIAL_BACKOFF_SECONDS
+
+    while not _shutdown_event.is_set():
+        try:
+            document = run_once(session, config)
+        except Exception:
+            log.exception("cycle failed unexpectedly; retrying in %ss", backoff)
+            _shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            continue
+
+        backoff = INITIAL_BACKOFF_SECONDS
+        interval = POLL_INTERVAL_BY_MODE.get(document["mode"], POLL_INTERVAL_IDLE)
+        log.info("next cycle in %ss (mode=%s)", interval, document["mode"])
+        _shutdown_event.wait(interval)
+
+    log.info("shutdown complete")
+
+
+def _run_once_requested() -> bool:
+    if "--once" in sys.argv[1:]:
+        return True
+    return os.environ.get("RUN_ONCE", "").strip().lower() in ("1", "true", "yes")
+
+
 if __name__ == "__main__":
-    run()
+    if _run_once_requested():
+        run()
+    else:
+        run_loop()

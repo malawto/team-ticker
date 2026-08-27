@@ -1,7 +1,14 @@
+import os
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 from poller import (
+    POLL_INTERVAL_BY_MODE,
+    POLL_INTERVAL_IDLE,
+    POLL_INTERVAL_LIVE,
+    POLL_INTERVAL_MATCHDAY,
+    _run_once_requested,
     build_ticker_document,
     determine_mode,
     headlines_from_rss,
@@ -393,6 +400,44 @@ class IdleModeTableAndHeadlinesIntegrationTests(unittest.TestCase):
         self.assertEqual(
             result["idle"]["headlines"][0], "Liverpool eye January move"
         )
+
+
+class PollIntervalTests(unittest.TestCase):
+    def test_interval_ordering_matches_urgency(self):
+        # live should poll fastest, idle slowest.
+        self.assertLess(POLL_INTERVAL_LIVE, POLL_INTERVAL_MATCHDAY)
+        self.assertLess(POLL_INTERVAL_MATCHDAY, POLL_INTERVAL_IDLE)
+
+    def test_mode_lookup_matches_spec(self):
+        self.assertEqual(POLL_INTERVAL_BY_MODE["live"], 60)
+        self.assertEqual(POLL_INTERVAL_BY_MODE["matchday"], 300)
+        self.assertEqual(POLL_INTERVAL_BY_MODE["idle"], 900)
+
+
+class RunOnceRequestedTests(unittest.TestCase):
+    def test_true_when_once_flag_passed(self):
+        with mock.patch("sys.argv", ["poller.py", "--once"]):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RUN_ONCE", None)
+                self.assertTrue(_run_once_requested())
+
+    def test_true_when_run_once_env_set(self):
+        with mock.patch("sys.argv", ["poller.py"]):
+            with mock.patch.dict(os.environ, {"RUN_ONCE": "true"}):
+                self.assertTrue(_run_once_requested())
+
+    def test_run_once_env_is_case_insensitive_and_accepts_1(self):
+        with mock.patch("sys.argv", ["poller.py"]):
+            with mock.patch.dict(os.environ, {"RUN_ONCE": "1"}):
+                self.assertTrue(_run_once_requested())
+            with mock.patch.dict(os.environ, {"RUN_ONCE": "TRUE"}):
+                self.assertTrue(_run_once_requested())
+
+    def test_false_by_default(self):
+        with mock.patch("sys.argv", ["poller.py"]):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RUN_ONCE", None)
+                self.assertFalse(_run_once_requested())
 
 
 if __name__ == "__main__":
