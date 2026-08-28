@@ -486,9 +486,18 @@ def table_slice_from_standings(
     for index, entry in enumerate(entries[start:end], start=start):
         team = entry.get("team") or {}
         stats = {stat.get("name"): stat.get("value") for stat in entry.get("stats") or []}
+        display_name = team.get("displayName") or team.get("name") or "Unknown"
         rows.append(
             {
-                "team": team.get("displayName") or team.get("name") or "Unknown",
+                "team": display_name,
+                # ESPN's short code (e.g. "LIV"), when present - a compact,
+                # disambiguated alternative to "team" for space-constrained
+                # display (unlike a naive truncation of "team", which risks
+                # collisions: "Manchester City"/"Manchester United" would
+                # both truncate to "Manc"). Falls back to a truncated name
+                # rather than omitting the field, so consumers don't need a
+                # second fallback path of their own.
+                "abbreviation": team.get("abbreviation") or display_name[:3].upper(),
                 "position": _safe_int(stats.get("rank")) or (index + 1),
                 "played": _safe_int(stats.get("gamesPlayed")),
                 "points": _safe_int(stats.get("points")),

@@ -275,6 +275,25 @@ class TableSliceFromStandingsTests(unittest.TestCase):
         self.assertTrue(liverpool_row["is_team"])
         self.assertFalse(table[0]["is_team"])
 
+    def test_uses_espn_abbreviation_when_present(self):
+        team_with_abbrev = {"id": "364", "displayName": "Liverpool", "abbreviation": "LIV"}
+        standings = _standings_with([_standings_entry(team_with_abbrev, 1, 3, 9, 6)])
+
+        table = table_slice_from_standings(standings, "364")
+
+        self.assertEqual(table[0]["abbreviation"], "LIV")
+
+    def test_falls_back_to_truncated_name_when_abbreviation_missing(self):
+        # No "abbreviation" key at all - shouldn't happen with real ESPN
+        # data, but a compact fallback beats omitting the field, so
+        # consumers don't need a second fallback path of their own.
+        team_without_abbrev = {"id": "364", "displayName": "Liverpool"}
+        standings = _standings_with([_standings_entry(team_without_abbrev, 1, 3, 9, 6)])
+
+        table = table_slice_from_standings(standings, "364")
+
+        self.assertEqual(table[0]["abbreviation"], "LIV")
+
     def test_clamps_at_top_of_table(self):
         # Brighton is 1st — there's no "2 above" to include, should just
         # clamp rather than error or wrap around.
