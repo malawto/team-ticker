@@ -8,21 +8,21 @@ No team or league is hardcoded — the reference/default instance is
 Liverpool FC / the English Premier League, but any team ESPN tracks works
 by changing two environment variables.
 
-## How it works
+## Architecture
 
-- **`backend/`** — a Python service (`poller.py`) that polls ESPN's
-  scoreboard/standings APIs and the BBC Sport RSS feed, determines a mode
-  (`live` / `matchday` / `idle`), and writes the result to `ticker.json`.
-  Runs as a Docker container.
-- **`firmware/`** — CircuitPython (`code.py`) for an Adafruit Matrix Portal
-  M4 driving a 64x32 HUB75 LED matrix, which polls `ticker.json` and
-  renders it as scrolling text: green while a match is live, amber on
-  matchday, red otherwise (next fixture, league table, headlines).
+```
+poller.py (Docker container, polls every 60s-15m)
+    -> writes ticker.json to a bind-mounted volume
+        -> nginx serves it directly as a static file, both:
+            - HTTPS (mkcert cert)   — for browsers/normal .home traffic
+            - plain HTTP, no redirect — for the Matrix Portal, which can't
+              install a custom CA on its ESP32 co-processor
+                -> Matrix Portal M4 polls the HTTP copy and renders it
+```
 
-The display polls `ticker.json` over **plain HTTP**, not HTTPS — the Matrix
-Portal's ESP32 co-processor doesn't handle installing a custom CA well. If
-you put the backend behind your own reverse proxy/TLS, also expose an
-unencrypted copy of `ticker.json` for the display to use.
+The backend and firmware never talk to each other directly — `ticker.json`
+on disk is the entire interface. Nothing else about the display (WiFi,
+polling, rendering) depends on how that file got there.
 
 ## Repository layout
 
@@ -31,43 +31,40 @@ backend/     Docker container + poller.py — fetches data, writes ticker.json
 firmware/    CircuitPython code for the Matrix Portal display
 ```
 
+## Configuration reference
+
+Set via `backend/.env` (copy from `backend/.env.example`):
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `TEAM_ID` | No | `364` (Liverpool FC) | ESPN's numeric team id. Find it by opening `https://site.api.espn.com/apis/site/v2/sports/soccer/<LEAGUE>/scoreboard` and reading a competitor's `team.id`. |
+| `LEAGUE` | No | `eng.1` | ESPN's league slug. |
+| `PUID` / `PGID` | No | `1000` / `1000` | UID/GID the container runs as — must match the host user that owns the bind-mounted `data/` directory. Check with `id <your-user>`. |
+| `TICKER_JSON_PATH` | No (container-internal) | `/data/ticker.json` | Set in the Dockerfile, not `.env` — where `ticker.json` is written inside the container. Only relevant if you change the Dockerfile/compose volume layout. |
+| `KUMA_PUSH_URL` | No | unset | Push-monitor URL (Uptime Kuma or compatible). See **Monitoring** below. |
+
+`TEAM_ID`/`LEAGUE` fail fast (the poller logs and exits) if set to something
+that isn't a plausible id/slug — better than silently polling the wrong
+team forever.
+
 ## Backend setup
 
 Requirements: Docker and Docker Compose.
 
-1. **Configure your team/league.**
+```sh
+cd backend
+cp .env.example .env
+# edit .env — see Configuration reference above
+docker compose up -d --build                              # local/dev
+docker compose -f docker-compose.prod.yml up -d --build    # production
+```
 
-   ```sh
-   cd backend
-   cp .env.example .env
-   ```
+`ticker.json` lands in the bind-mounted `data/` directory. Serve that
+directory (or just the file) over plain HTTP for the display — see
+**nginx / deployment notes** below for exactly how this project does it.
 
-   Edit `.env`:
-
-   | Variable | Required | Notes |
-   |---|---|---|
-   | `TEAM_ID` | No | ESPN's numeric team id. Find it by opening `https://site.api.espn.com/apis/site/v2/sports/soccer/<LEAGUE>/scoreboard` and reading a competitor's `team.id`. Defaults to `364` (Liverpool FC). |
-   | `LEAGUE` | No | ESPN's league slug, e.g. `eng.1`. Defaults to `eng.1`. |
-   | `PUID` / `PGID` | No | UID/GID the container runs as — match the host user that should own the bind-mounted `data/` directory. Check with `id <your-user>`. Default to `1000`/`1000`. |
-   | `KUMA_PUSH_URL` | No | Push-monitor URL (Uptime Kuma or compatible). Every successful cycle pings `status=up`; a failed cycle pings `status=down` before backing off. Omit to skip heartbeats entirely. |
-
-2. **Run it.**
-
-   ```sh
-   # Local/dev
-   docker compose up -d --build
-
-   # Production (adds restart: unless-stopped and a fixed container name)
-   docker compose -f docker-compose.prod.yml up -d --build
-   ```
-
-3. **Serve `ticker.json`.** It's written to the bind-mounted `data/`
-   directory. Serve that directory (or just the file) over plain HTTP so
-   the display can reach it — how (nginx, Caddy, etc.) is up to your own
-   setup.
-
-The poll interval adapts to the mode just written: 60s while a match is
-live, 5 minutes on matchday, 15 minutes idle.
+Poll interval adapts to the mode just written: 60s while a match is live,
+5 minutes on matchday, 15 minutes idle.
 
 ### Running tests
 
@@ -78,34 +75,242 @@ pip install -r requirements.txt
 python -m unittest tests.test_poller
 ```
 
-## Firmware setup
+## ESPN/BBC API quirks
+
+These cost real debugging time to work out and are easy to "fix" back to
+wrong later, so they're pinned down here rather than left as tribal
+knowledge:
+
+- **Standings live at a different path than you'd guess.** The scoreboard
+  endpoint's sibling path, `apis/site/v2/.../standings`, returns an empty
+  `{}` for at least `eng.1`. The endpoint that actually returns standings
+  data is `apis/v2/.../standings` — no `site/` segment. See
+  `STANDINGS_URL_TEMPLATE` in `poller.py`.
+- **The team "schedule" endpoint only ever returns already-played
+  fixtures** — confirmed dead end, `?season=` and `?half=` params don't
+  change that. Getting the *next* fixture instead requires querying the
+  **scoreboard** endpoint with a forward-looking `dates=YYYYMMDD-YYYYMMDD`
+  range param (see `fetch_upcoming_scoreboard`), not the schedule endpoint
+  at all.
+- **A claimed `curl`-vs-`requests` blocking difference did not reproduce.**
+  Earlier notes on this project described `curl` getting blocked (403,
+  Akamai TLS fingerprinting) against these ESPN endpoints while Python's
+  `requests` worked fine. Retested live against all three endpoints
+  (scoreboard, standings, BBC RSS) immediately before writing this section:
+  plain `curl` returned `200` consistently, no blocking observed. Not
+  removing the possibility this was real under some other condition (a
+  different `curl` version, a flagged IP, Akamai's detection changing
+  over time) — just noting it isn't currently reproducible, so don't trust
+  it as a debugging shortcut without reverifying.
+
+## Docker / deployment notes
+
+- **`user: "${PUID:-1000}:${PGID:-1000}"` in compose, not baked into the
+  image or handled by an entrypoint privilege-drop script.** The
+  Dockerfile's `ENTRYPOINT ["python", "poller.py"]` is exec-form with no
+  shell or `su`/`gosu` wrapper, so `python` runs as PID 1 directly, already
+  running as the UID/GID compose assigned at container start. `docker stop`'s
+  SIGTERM reaches `poller.py`'s own signal handler immediately — no signal
+  proxying through an intermediate process needed. Baking a UID into the
+  image, or dropping privilege at runtime via an entrypoint script, would
+  both complicate that for no benefit.
+- **Why `PUID`/`PGID` are configurable at all, not hardcoded**: the dev
+  machine and the deploy host have different `mike` UID/GID
+  (`1000:1000` vs `1000:100`). A UID baked in at build time would only be
+  correct on one of them by coincidence.
+- **nginx serves `ticker.json` directly as a static file** (`root
+  .../data;` + `try_files $uri =404;`), not reverse-proxied — the container
+  has no HTTP server of its own, it just writes a file. Two server blocks
+  on the same host/port pattern used elsewhere in this homelab: HTTPS with
+  a mkcert cert, and plain HTTP with **no redirect** to HTTPS (unlike every
+  other `.home` site here) specifically because the Matrix Portal can't
+  follow a redirect to a scheme it can't establish trust for.
+- **`setfacl -m u:www-data:--x /home/mike` was required** on the deploy
+  host. This was the first service there to have nginx read a file
+  straight off disk under a user's home directory rather than reverse
+  proxying to a container's own port — nginx (running as `www-data`) needs
+  execute permission on every directory in the path down to the served
+  file (`/home/mike/docker/lfc-ticker/data/ticker.json`), not just
+  read permission on the file itself.
+
+## `ticker.json` schema
+
+Firmware only reads `next_fixture`, `full_table`, and `headlines` from
+`idle` — `table` (a ±2-team window around your team) is additional data in
+the payload not currently consumed by the reference firmware, useful if
+you build a narrower display instead of the full vertical scroll.
+
+<details>
+<summary>Real example (idle mode, trimmed)</summary>
+
+```json
+{
+  "mode": "idle",
+  "idle": {
+    "next_fixture": {
+      "opponent": "Nottingham Forest",
+      "kickoff_utc": "2026-08-29T11:30Z",
+      "home_away": "home"
+    },
+    "table": [
+      { "team": "Liverpool", "abbreviation": "LIV", "position": 10, "played": 1, "points": 1, "goal_difference": 0, "is_team": true }
+    ],
+    "full_table": [
+      { "team": "Manchester City", "abbreviation": "MNC", "position": 1, "played": 2, "points": 6, "goal_difference": 4, "is_team": false }
+    ],
+    "headlines": [
+      "What will Jackson bring to Villa with Watkins set for exit?"
+    ]
+  },
+  "generated_at": "2026-08-28T21:17:18Z"
+}
+```
+
+`mode` is `"live"` or `"matchday"` instead, with a differently-shaped
+top-level key to match:
+
+```json
+{ "mode": "live", "live": {
+  "opponent": "...", "home_away": "home",
+  "score": { "team": 2, "opponent": 1 },
+  "clock": "67'", "period": 2, "status_detail": "2nd Half"
+}}
+```
+
+```json
+{ "mode": "matchday", "matchday": {
+  "opponent": "...", "home_away": "away",
+  "kickoff_utc": "2026-08-29T11:30Z"
+}}
+```
+
+`matchday` gets a `final_score` key instead of `kickoff_utc` once the match
+has finished but before ESPN's data settles back to a normal fixture.
+
+</details>
+
+## Matrix Portal firmware
 
 Hardware: an Adafruit Matrix Portal M4 driving a 64x32 HUB75 LED matrix
-panel, running CircuitPython 10.2.1.
+panel, running **CircuitPython 10.2.1**.
 
-1. **Install CircuitPython 10.2.1** on the board (see Adafruit's Matrix
-   Portal M4 guide), then copy onto the `CIRCUITPY` drive:
+1. Install CircuitPython 10.2.1 on the board, then copy onto the
+   `CIRCUITPY` drive:
    - `firmware/code.py` → `code.py`
-   - The `adafruit_display_text` and `adafruit_matrixportal` libraries (and
-     their dependencies) from the Adafruit CircuitPython Bundle matching
-     your installed CircuitPython version, into `lib/`.
+   - The library bundle below → `lib/`
 
-2. **Copy `firmware/secrets.py.example` → `secrets.py`** on the `CIRCUITPY`
-   drive and fill in:
+2. Copy `firmware/secrets.py.example` → `secrets.py` on `CIRCUITPY` and
+   fill in:
 
    | Key | Required | Notes |
    |---|---|---|
    | `ssid` / `password` | Yes | Your WiFi network. |
-   | `ticker_url` | Yes | The plain-HTTP URL to your backend's `ticker.json`, e.g. `http://your-ticker-host/ticker.json`. |
-   | `utc_offset_minutes` | No | In minutes, not hours, so fractional-hour timezones are exact. Also shows kickoff times converted to local time alongside UTC. |
+   | `ticker_url` | Yes | Plain-HTTP URL to your backend's `ticker.json`. |
+   | `utc_offset_minutes` | No | In minutes, not hours — exact for fractional-hour timezones. |
    | `timezone_label` | No | Label shown next to the converted local time, e.g. `"EDT"`. |
 
-3. **Save.** CircuitPython auto-reloads and starts polling.
+3. Save — CircuitPython auto-reloads and starts polling.
 
-## Notes
+<details>
+<summary>CircuitPython library bundle (traced from actual imports, CircuitPython 10.2.1)</summary>
 
-- `secrets.py` and `.env` are both gitignored — never commit real
-  credentials. Only the `.example` templates are tracked.
-- Every team/league/network-specific value lives in `.env` (backend) or
-  `secrets.py` (firmware) — the code itself has nothing team-specific baked
-  in.
+`code.py` itself only directly imports `adafruit_display_text` and
+`adafruit_matrixportal` — `adafruit_matrixportal.matrixportal.MatrixPortal`
+is a fairly heavy convenience wrapper (WiFi, HTTP, and more) that pulls in
+most of the rest transitively. This is the exact set verified working on
+the actual device, so a future re-provision doesn't need to re-trace
+imports from scratch:
+
+```
+adafruit_bitmap_font/
+adafruit_bus_device/
+adafruit_connection_manager.mpy
+adafruit_display_text/
+adafruit_esp32spi/
+adafruit_fakerequests.mpy
+adafruit_matrixportal/
+adafruit_portalbase/
+adafruit_requests.mpy
+adafruit_ticks.mpy
+neopixel.mpy
+simpleio.mpy
+```
+
+`adafruit_imageload/`, `adafruit_io/`, `adafruit_minimqtt/`, and
+`adafruit_miniqr.mpy` are also present on the currently-provisioned device
+but **not required** by the current `code.py` — `adafruit_imageload` is a
+leftover from an abandoned team-crest interstitial feature (reverted for
+memory-safety reasons, see git history), the rest came bundled with
+`adafruit_matrixportal`'s optional extras. Safe to omit all four on a
+fresh provision.
+
+</details>
+
+### Rendering pattern: fighting a heap that never defragments
+
+CircuitPython's allocator does not compact or defragment memory —
+`gc.collect()` reclaims garbage but can't relocate live objects to close
+gaps, so on a board this memory-constrained, fragmentation alone can crash
+a `Label.text` assignment that's well within the *total* free memory
+reported. Two patterns exist specifically to avoid that, confirmed live on
+hardware over many rounds of `MemoryError` crashes:
+
+- **One `Label` object, created once at boot, reused for everything** by
+  mutating `.text`/`.color`/`.x`/`.y` — not a fresh `Label` per screen.
+  `MatrixPortal.add_text()`/`set_text()` allocate a brand-new `Label` every
+  call, which is fine for text that rarely changes but fragments the heap
+  fast at this project's update rate (2-3+ text changes per poll cycle).
+  A second permanent `Label` (tried for standings row-coloring) and a
+  permanent `TileGrid`+`Bitmap` (tried for a crest interstitial) were both
+  independently found to push this board over the edge even at small
+  sizes — the constraint is the *number* of permanent `displayio` objects
+  in the render tree, not any single one's content size. Both were
+  reverted; the standings table renders in one color, and there's no crest
+  feature.
+- **One screen per headline, not one screen with all of them joined.** A
+  ~400+ character joined string reliably crashed `Label._update_text` even
+  on the very first cycle with plenty of `gc.mem_free()` reported — the
+  allocator couldn't find one contiguous block that size despite enough
+  *total* free memory. Same reasoning applies to the standings table: it
+  renders in `TABLE_CHUNK_SIZE`-row chunks, not as one continuous scroll
+  through all ~20 teams.
+
+### `ascii_safe()`
+
+`terminalio.FONT` only covers a roughly US-keyboard character set.
+Football headlines routinely include £ (transfer fees), en/em dashes, and
+curly quotes — `ascii_safe()` substitutes the common ones to something
+legible and drops anything else outside ASCII, rather than every
+unmapped character rendering as a stray `.`.
+
+### Flashing: use a different machine than the primary dev machine
+
+Bilbo's (this project's dev machine) USB stack reports 0 capacity on this
+board's UF2 bootloader mass-storage device — flashing from Bilbo does not
+work. Root cause unconfirmed (untested whether it's a Linux/Windows driver
+difference or just needed a power cycle at the time). Flashing from a
+Windows machine worked without issue. Don't spend time re-discovering
+this — just use a different machine.
+
+## Monitoring
+
+Set `KUMA_PUSH_URL` to an Uptime Kuma (or compatible) push-monitor URL.
+Every cycle that successfully writes `ticker.json` pushes `status=up`;
+a cycle that fails pushes an explicit `status=down` with a short failure
+message *before* the poller's own backoff/retry kicks in, rather than
+relying on Kuma's own timeout detection alone to notice a dead poller. A
+failed heartbeat push is logged and swallowed — monitoring must never be
+able to take down the primary polling function.
+
+Uptime Kuma's own monitor-side check/retry window (configured in the Kuma
+web UI, not this repo) should be set longer than the poller's longest gap
+between pushes — 900s in idle mode — to avoid false "down" alerts between
+legitimate heartbeats.
+
+## Where secrets live
+
+`backend/.env`, the Uptime Kuma push URL, and the Matrix Portal's WiFi
+credentials/`secrets.py` are all stored in 1Password — not reproduced here.
+Only `.example` templates (`backend/.env.example`,
+`firmware/secrets.py.example`) are committed; the real files are
+gitignored.
