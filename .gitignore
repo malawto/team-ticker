@@ -1,8 +1,9 @@
-.env
+backend/.env
+backend/data/
+backend/.venv/
+backend/extra-ca-certs/*
+!backend/extra-ca-certs/.gitkeep
 __pycache__/
 *.pyc
 ticker.json
 firmware/secrets.py
-extra-ca-certs/*
-!extra-ca-certs/.gitkeep
-.venv/
