@@ -41,9 +41,18 @@ COLOR_STATUS = 0x666666  # connecting / error states
 # Longest string we'll ever try to display - now that headlines are shown
 # one at a time (see build_screens) rather than joined, the table screen
 # (~120 chars observed) is the longest realistic content; this leaves
-# headroom above that without permanently reserving more Label buffer than
-# needed. Text longer than this gets truncated before being assigned (see
-# show_screen) rather than raising.
+# headroom above that. Text longer than this gets truncated before being
+# assigned (see show_screen) rather than raising.
+#
+# On CircuitPython 6 / adafruit_display_text 2.x, this was also passed to
+# Label's constructor as max_glyphs to pre-size its glyph buffer once up
+# front, avoiding a reallocate-on-every-.text-assignment pattern that
+# fragmented this board's small heap until an allocation failed outright
+# (observed live). adafruit_display_text 5.x (this CircuitPython 10.x
+# install) removed max_glyphs from Label's constructor entirely - its
+# _set_text() still calls an internal _reset_text() on every assignment,
+# so re-verify this crash doesn't recur under the new library rather than
+# assume the newer allocator/GC makes the old workaround unnecessary.
 MAX_GLYPHS = 200
 
 matrixportal = MatrixPortal(status_neopixel=board.NEOPIXEL, bit_depth=6, debug=False)
@@ -52,17 +61,13 @@ matrixportal = MatrixPortal(status_neopixel=board.NEOPIXEL, bit_depth=6, debug=F
 # every single call (confirmed in the installed adafruit_matrixportal
 # source) - fine for a label that rarely changes, but this display updates
 # its text 2-3+ times per poll cycle, and repeatedly allocating/discarding
-# Label/TileGrid/palette objects fragments this board's small heap until an
-# allocation eventually fails outright (observed live: MemoryError during
-# set_text() after a handful of cycles). Managing a single, pre-sized Label
-# directly and just mutating .text/.color/.x on it avoids that churn
-# entirely - max_glyphs is the anti-fragmentation lever here: sized once
-# up front, every later .text assignment reuses that same fixed buffer
-# instead of resizing/reallocating it.
+# Label/TileGrid/palette objects fragments this board's small heap. Managing
+# a single, reused Label directly and just mutating .text/.color/.x on it
+# avoids that specific churn regardless of whether max_glyphs pre-sizing is
+# available in the installed library version.
 _label = Label(
     terminalio.FONT,
     text="Connecting...",
-    max_glyphs=MAX_GLYPHS,
     color=COLOR_STATUS,
 )
 _label.y = matrixportal.display.height // 2 - 1
