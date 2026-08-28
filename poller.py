@@ -456,6 +456,29 @@ def _standings_entries(standings_data: Optional[dict]) -> list[dict]:
     return entries
 
 
+def _row_from_entry(entry: dict, index: int, team_id: str) -> dict:
+    """Shared by table_slice_from_standings and full_table_from_standings -
+    the only difference between them is which entries they pass in here."""
+    team = entry.get("team") or {}
+    stats = {stat.get("name"): stat.get("value") for stat in entry.get("stats") or []}
+    display_name = team.get("displayName") or team.get("name") or "Unknown"
+    return {
+        "team": display_name,
+        # ESPN's short code (e.g. "LIV"), when present - a compact,
+        # disambiguated alternative to "team" for space-constrained display
+        # (unlike a naive truncation of "team", which risks collisions:
+        # "Manchester City"/"Manchester United" would both truncate to
+        # "Manc"). Falls back to a truncated name rather than omitting the
+        # field, so consumers don't need a second fallback path of their own.
+        "abbreviation": team.get("abbreviation") or display_name[:3].upper(),
+        "position": _safe_int(stats.get("rank")) or (index + 1),
+        "played": _safe_int(stats.get("gamesPlayed")),
+        "points": _safe_int(stats.get("points")),
+        "goal_difference": _safe_int(stats.get("pointDifferential")),
+        "is_team": str((team.get("id") or "")) == str(team_id),
+    }
+
+
 def table_slice_from_standings(
     standings_data: Optional[dict],
     team_id: str,
@@ -466,7 +489,8 @@ def table_slice_from_standings(
 
     Returns [] if the team isn't found in the standings (newly promoted and
     not yet listed, unexpected response shape, etc.) rather than raising.
-    Pure function, no network access.
+    Pure function, no network access. See full_table_from_standings for the
+    unwindowed equivalent.
     """
     entries = _standings_entries(standings_data)
 
@@ -482,30 +506,27 @@ def table_slice_from_standings(
     start = max(0, team_index - context)
     end = min(len(entries), team_index + context + 1)
 
-    rows = []
-    for index, entry in enumerate(entries[start:end], start=start):
-        team = entry.get("team") or {}
-        stats = {stat.get("name"): stat.get("value") for stat in entry.get("stats") or []}
-        display_name = team.get("displayName") or team.get("name") or "Unknown"
-        rows.append(
-            {
-                "team": display_name,
-                # ESPN's short code (e.g. "LIV"), when present - a compact,
-                # disambiguated alternative to "team" for space-constrained
-                # display (unlike a naive truncation of "team", which risks
-                # collisions: "Manchester City"/"Manchester United" would
-                # both truncate to "Manc"). Falls back to a truncated name
-                # rather than omitting the field, so consumers don't need a
-                # second fallback path of their own.
-                "abbreviation": team.get("abbreviation") or display_name[:3].upper(),
-                "position": _safe_int(stats.get("rank")) or (index + 1),
-                "played": _safe_int(stats.get("gamesPlayed")),
-                "points": _safe_int(stats.get("points")),
-                "goal_difference": _safe_int(stats.get("pointDifferential")),
-                "is_team": index == team_index,
-            }
-        )
-    return rows
+    return [
+        _row_from_entry(entry, index, team_id)
+        for index, entry in enumerate(entries[start:end], start=start)
+    ]
+
+
+def full_table_from_standings(
+    standings_data: Optional[dict], team_id: str
+) -> list[dict]:
+    """Return every team's standings row, sorted by position - no windowing.
+
+    Same row shape and defensive handling as table_slice_from_standings
+    (returns [] rather than raising on missing/malformed data), just without
+    the ±context slicing - for a display that scrolls through the whole
+    table rather than showing a fixed-size neighborhood around the
+    configured team. Pure function, no network access.
+    """
+    entries = _standings_entries(standings_data)
+    return [
+        _row_from_entry(entry, index, team_id) for index, entry in enumerate(entries)
+    ]
 
 
 def headlines_from_rss(
@@ -586,6 +607,7 @@ def determine_mode(
                 upcoming_scoreboard_data, team_id, now
             ),
             "table": table,
+            "full_table": full_table_from_standings(standings_data, team_id),
             "headlines": headlines_from_rss(
                 headlines_xml, team_display_name=team_display_name
             ),

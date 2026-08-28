@@ -11,6 +11,7 @@ from poller import (
     _run_once_requested,
     build_ticker_document,
     determine_mode,
+    full_table_from_standings,
     headlines_from_rss,
     push_kuma_heartbeat,
     table_slice_from_standings,
@@ -39,6 +40,20 @@ def _standings_entry(team, position, played, points, goal_difference):
 
 def _standings_with(entries):
     return {"children": [{"standings": {"entries": entries}}]}
+
+
+def _seven_team_standings():
+    teams = [
+        ({"id": "331", "displayName": "Brighton"}, 1, 3, 9, 6),
+        ({"id": "359", "displayName": "Arsenal"}, 2, 3, 7, 5),
+        ({"id": "337", "displayName": "Brentford"}, 3, 3, 6, 3),
+        (LIVERPOOL, 4, 3, 6, 2),
+        ({"id": "368", "displayName": "Everton"}, 5, 3, 5, 1),
+        ({"id": "382", "displayName": "Manchester City"}, 6, 3, 4, 0),
+        ({"id": "361", "displayName": "Newcastle United"}, 7, 3, 3, -2),
+    ]
+    entries = [_standings_entry(*team) for team in teams]
+    return _standings_with(entries)
 
 
 def _competition(state, team_score, opp_score, home_away="home",
@@ -246,21 +261,8 @@ class DetermineModeTests(unittest.TestCase):
 
 
 class TableSliceFromStandingsTests(unittest.TestCase):
-    def _seven_team_standings(self):
-        teams = [
-            ({"id": "331", "displayName": "Brighton"}, 1, 3, 9, 6),
-            ({"id": "359", "displayName": "Arsenal"}, 2, 3, 7, 5),
-            ({"id": "337", "displayName": "Brentford"}, 3, 3, 6, 3),
-            (LIVERPOOL, 4, 3, 6, 2),
-            ({"id": "368", "displayName": "Everton"}, 5, 3, 5, 1),
-            ({"id": "382", "displayName": "Manchester City"}, 6, 3, 4, 0),
-            ({"id": "361", "displayName": "Newcastle United"}, 7, 3, 3, -2),
-        ]
-        entries = [_standings_entry(*team) for team in teams]
-        return _standings_with(entries)
-
     def test_returns_team_plus_context_either_side(self):
-        table = table_slice_from_standings(self._seven_team_standings(), "364")
+        table = table_slice_from_standings(_seven_team_standings(), "364")
 
         self.assertEqual(len(table), 5)  # 2 above + team + 2 below
         self.assertEqual(
@@ -297,7 +299,7 @@ class TableSliceFromStandingsTests(unittest.TestCase):
     def test_clamps_at_top_of_table(self):
         # Brighton is 1st — there's no "2 above" to include, should just
         # clamp rather than error or wrap around.
-        table = table_slice_from_standings(self._seven_team_standings(), "331")
+        table = table_slice_from_standings(_seven_team_standings(), "331")
 
         self.assertEqual(len(table), 3)  # team + 2 below only
         self.assertEqual(table[0]["team"], "Brighton")
@@ -306,7 +308,7 @@ class TableSliceFromStandingsTests(unittest.TestCase):
     def test_team_not_found_returns_empty_list(self):
         # Newly promoted / not yet listed / unexpected shape - must not
         # crash, just degrade to an empty table.
-        table = table_slice_from_standings(self._seven_team_standings(), "999999")
+        table = table_slice_from_standings(_seven_team_standings(), "999999")
         self.assertEqual(table, [])
 
     def test_missing_standings_data_returns_empty_list(self):
@@ -318,6 +320,48 @@ class TableSliceFromStandingsTests(unittest.TestCase):
         self.assertEqual(
             table_slice_from_standings({"children": [{"standings": None}]}, "364"), []
         )
+
+
+class FullTableFromStandingsTests(unittest.TestCase):
+    def test_returns_every_team_no_windowing(self):
+        table = full_table_from_standings(_seven_team_standings(), "364")
+
+        self.assertEqual(len(table), 7)
+        self.assertEqual(
+            [row["team"] for row in table],
+            [
+                "Brighton",
+                "Arsenal",
+                "Brentford",
+                "Liverpool",
+                "Everton",
+                "Manchester City",
+                "Newcastle United",
+            ],
+        )
+
+    def test_flags_the_configured_team_wherever_it_is(self):
+        table = full_table_from_standings(_seven_team_standings(), "364")
+
+        flagged = [row["team"] for row in table if row["is_team"]]
+        self.assertEqual(flagged, ["Liverpool"])
+
+    def test_no_team_flagged_when_team_id_not_present(self):
+        # Unlike table_slice_from_standings, there's no "team not found"
+        # empty-list special case here - the full table just renders with
+        # nothing flagged, since there's no windowing decision that depends
+        # on finding the team first.
+        table = full_table_from_standings(_seven_team_standings(), "999999")
+
+        self.assertEqual(len(table), 7)
+        self.assertFalse(any(row["is_team"] for row in table))
+
+    def test_missing_standings_data_returns_empty_list(self):
+        self.assertEqual(full_table_from_standings(None, "364"), [])
+        self.assertEqual(full_table_from_standings({}, "364"), [])
+
+    def test_malformed_standings_shape_returns_empty_list_not_crash(self):
+        self.assertEqual(full_table_from_standings({"children": "nope"}, "364"), [])
 
 
 class HeadlinesFromRssTests(unittest.TestCase):
