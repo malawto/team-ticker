@@ -1,4 +1,4 @@
-# Local dev/test only. See docker-compose.pi5-nas.yml for the real deploy
+# Local dev/test only. See docker-compose.prod.yml for the real deploy
 # (PUID/PGID for the actual host user, restart policy, the real bind-mount
 # path under ~/docker/lfc-ticker/).
 services:

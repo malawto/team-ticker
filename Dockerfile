@@ -9,7 +9,7 @@ COPY poller.py .
 
 # No user/UID baked in here. Which host user this container runs as is set
 # per-deployment via the compose file's `user: "${PUID}:${PGID}"` (see
-# docker-compose.yml for local dev, docker-compose.pi5-nas.yml for the real
+# docker-compose.yml for local dev, docker-compose.prod.yml for the real
 # deploy) — the same image works correctly regardless of which UID/GID owns
 # the bind-mounted /data directory on a given host, rather than a UID
 # hardcoded at build time that only happens to be right by coincidence.
