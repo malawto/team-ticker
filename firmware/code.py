@@ -28,6 +28,17 @@ TICKER_URL = secrets["ticker_url"]
 
 FETCH_INTERVAL = 60  # seconds between polls of the backend
 SCROLL_FRAME_DELAY = 0.02  # seconds per scroll pixel-step
+STICK_PAUSE_SECONDS = 1.0  # pause when the standings' vertical scroll centers your team
+# Max rows rendered in a single vertical-scroll Label.text assignment (see
+# build_screens' standings handling). Two competing failure modes observed
+# live: too large in one block crashes outright (MemoryError, the full
+# ~20-team table as one chunk), but too many small chunks per cycle also
+# crashes - not from any single assignment's size, but from a real
+# cross-cycle memory drop (~7.6KB/cycle observed at chunk_size=5, 4 chunks/
+# cycle) that gc.collect() isn't fully recovering. 10 halves the chunk
+# count (2 instead of 4) while staying well under the size that crashed
+# outright - re-verify this doesn't just move the same leak, not assumed.
+TABLE_CHUNK_SIZE = 10
 
 # Our own diagnostic prints (screen contents, mode). Off by default so the
 # shipped version isn't chatty; flip to True when debugging on serial.
@@ -38,11 +49,14 @@ COLOR_MATCHDAY = 0xCC7700
 COLOR_IDLE = 0xCC0000
 COLOR_STATUS = 0x666666  # connecting / error states
 
-# Longest string we'll ever try to display - now that headlines are shown
-# one at a time (see build_screens) rather than joined, the table screen
-# (~120 chars observed) is the longest realistic content; this leaves
-# headroom above that. Text longer than this gets truncated before being
-# assigned (see show_screen) rather than raising.
+# Longest string we'll ever try to display - a single headline (~40-90
+# chars observed) or one TABLE_CHUNK_SIZE-row standings chunk, both well
+# under this. The full ~20-team standings table would be far longer, but is
+# deliberately never rendered as one block - see build_screens' standings
+# handling for why (a single that-large Label.text assignment reliably
+# crashed with MemoryError, observed live). Text longer than this gets
+# truncated before being assigned (see _set_label_text) rather than
+# raising, as a backstop, not the primary defense.
 #
 # On CircuitPython 6 / adafruit_display_text 2.x, this was also passed to
 # Label's constructor as max_glyphs to pre-size its glyph buffer once up
@@ -72,6 +86,13 @@ _label = Label(
 )
 _label.y = matrixportal.display.height // 2 - 1
 matrixportal.splash.append(_label)
+
+# A second persistent Label (to render your team's standings row in a
+# different colour from the rest) was tried and dropped - it measurably
+# pushed this board's already-tight memory budget over the edge (observed
+# live: a MemoryError on the very next screen after a cycle with the extra
+# Label present, gc.mem_free() at ~13KB vs the usual 20-30KB). Standings
+# rows all render in one colour via _label alone; see show_screen_vertical.
 
 # terminalio.FONT only covers a roughly US-keyboard character set; anything
 # outside it renders as a stray "." rather than raising, but football news
@@ -149,11 +170,24 @@ def fetch_ticker():
         return None
 
 
+def _h_screen(text, color):
+    """A screen rendered as a single horizontally-scrolling line."""
+    return {"kind": "h", "text": text, "color": color}
+
+
+def _v_screen(rows, team_index, color):
+    """A screen rendered as a vertically-scrolling stack of short rows,
+    bottom-to-top. If team_index is not None, sticks with `rows[team_index]`
+    centered for a moment before continuing off the top.
+    """
+    return {"kind": "v", "rows": rows, "team_index": team_index, "color": color}
+
+
 def build_screens(data):
-    """Turn a parsed ticker.json dict into a list of (text, color) screens
-    to show in sequence. live/matchday produce a single screen; idle
-    produces up to three (next fixture, table slice, headlines) so they
-    rotate distinctly rather than blurring into one continuous scroll.
+    """Turn a parsed ticker.json dict into a list of screens to show in
+    sequence (see _h_screen/_v_screen). live/matchday produce a single
+    screen; idle produces several (next fixture, standings, headlines) so
+    they rotate distinctly rather than blurring into one continuous scroll.
     """
     mode = data.get("mode")
 
@@ -168,7 +202,7 @@ def build_screens(data):
             score.get("opponent", "?"),
             live.get("clock") or "",
         )
-        return [(text, COLOR_LIVE)]
+        return [_h_screen(text, COLOR_LIVE)]
 
     if mode == "matchday":
         matchday = data.get("matchday") or {}
@@ -183,7 +217,7 @@ def build_screens(data):
             text = "{} {}  {}".format(
                 vs, opponent, format_kickoff(matchday.get("kickoff_utc"))
             )
-        return [(text, COLOR_MATCHDAY)]
+        return [_h_screen(text, COLOR_MATCHDAY)]
 
     if mode == "idle":
         idle = data.get("idle") or {}
@@ -199,22 +233,44 @@ def build_screens(data):
             )
         else:
             text = "NEXT: TBD"
-        screens.append((text, COLOR_IDLE))
+        screens.append(_h_screen(text, COLOR_IDLE))
 
-        table = idle.get("table") or []
-        if table:
+        # Standings scroll vertically (bottom to top, one short row per
+        # team, the whole table not just a window around your team) rather
+        # than as one long horizontal line - "10.Liverpool 1pt"-style rows
+        # are far wider than the 64px panel at any usable font size, but
+        # ESPN's own short "abbreviation" code (e.g. "LIV") keeps each row
+        # narrow without needing a smaller font at all.
+        #
+        # Rendered as several small chunks (one screen each), not one
+        # continuous scroll through all ~20 teams - a single Label.text
+        # assignment that large reliably crashed (observed live:
+        # MemoryError inside Label._update_text, same failure class as the
+        # joined-headlines crash this same project hit earlier). TABLE_CHUNK_SIZE
+        # matches the old ±2-context window size, already proven safe.
+        # Only the chunk containing your team gets the stick pause; other
+        # chunks scroll straight through. (A second colour just for your
+        # team's row was tried and dropped - see _label's definition - so
+        # every row here renders the same COLOR_IDLE as the rest of idle
+        # mode; the ">" marker is what identifies your row now.)
+        table = idle.get("full_table") or []
+        for chunk_start in range(0, len(table), TABLE_CHUNK_SIZE):
+            chunk = table[chunk_start : chunk_start + TABLE_CHUNK_SIZE]
             rows = []
-            for row in table:
-                marker = ">" if row.get("is_team") else ""
+            team_index = None
+            for index, row in enumerate(chunk):
+                if row.get("is_team"):
+                    team_index = index
+                marker = ">" if row.get("is_team") else " "
                 rows.append(
-                    "{}{}.{} {}pt".format(
+                    "{}{} {} {}p".format(
                         marker,
                         row.get("position", "?"),
-                        row.get("team", "?"),
+                        row.get("abbreviation") or row.get("team", "?"),
                         row.get("points", "?"),
                     )
                 )
-            screens.append(("  |  ".join(rows), COLOR_IDLE))
+            screens.append(_v_screen(rows, team_index, COLOR_IDLE))
 
         # One screen per headline, not one screen with all of them joined -
         # a ~400+ char joined string reliably crashed rendering (observed
@@ -228,24 +284,34 @@ def build_screens(data):
         # contiguous memory each time.
         headlines = idle.get("headlines") or []
         for headline in headlines:
-            screens.append((headline, COLOR_IDLE))
+            screens.append(_h_screen(headline, COLOR_IDLE))
 
         if not screens:
-            screens.append(("No data", COLOR_IDLE))
+            screens.append(_h_screen("No data", COLOR_IDLE))
         return screens
 
-    return [("Unknown mode: {}".format(mode), COLOR_STATUS)]
+    return [_h_screen("Unknown mode: {}".format(mode), COLOR_STATUS)]
 
 
-def show_screen(text, color):
-    gc.collect()  # max headroom before the longest strings (headlines)
-
+def _set_label_text(text):
     text = ascii_safe(text)
     if len(text) > MAX_GLYPHS:
         text = text[:MAX_GLYPHS]
+    _label.text = text
+    return text
+
+
+def show_screen_horizontal(text, color):
+    """Scroll a single line right-to-left across the panel."""
+    gc.collect()  # max headroom before the longest strings (headlines)
 
     _label.color = color
-    _label.text = text
+    _set_label_text(text)
+    # A vertical screen may have left .y off in the weeds (see
+    # show_screen_vertical) - a single-line screen always renders at a
+    # fixed vertical center, so restore it explicitly rather than
+    # inheriting wherever the last screen happened to leave it.
+    _label.y = matrixportal.display.height // 2 - 1
 
     display_width = matrixportal.display.width
     line_width = _label.bounding_box[2]
@@ -257,8 +323,89 @@ def show_screen(text, color):
     gc.collect()
 
 
+def show_screen_vertical(rows, team_index, color):
+    """Scroll a stack of short rows (one chunk of the standings - see
+    build_screens' TABLE_CHUNK_SIZE) bottom-to-top, all in one colour. If
+    team_index is not None, pauses with `rows[team_index]` centered for
+    STICK_PAUSE_SECONDS before continuing off the top; if None (this chunk
+    doesn't contain your team), scrolls straight through with no pause.
+
+    Row/line height is measured from the Label's own rendered bounding_box
+    rather than assumed, since exact font metrics have proven unreliable to
+    hardcode across CircuitPython/adafruit_display_text versions in this
+    project (see MAX_GLYPHS's history) - this stays correct regardless of
+    the installed font's actual pixel dimensions.
+    """
+    gc.collect()
+
+    sanitized = [_set_label_text_line(row) for row in rows]
+    _label.color = color
+    _label.x = 0
+    _label.text = "\n".join(sanitized)
+
+    display_height = matrixportal.display.height
+    total_height = _label.bounding_box[3]
+    if total_height <= 0 or not rows:
+        return
+
+    row_height = total_height / len(rows)
+    start_y = display_height
+    end_y = -total_height
+
+    if team_index is None:
+        stick_y = None
+    else:
+        team_center_offset = team_index * row_height + row_height / 2
+        stick_y = (display_height / 2) - team_center_offset
+
+    if DEBUG:
+        print(
+            "vscroll: rows={} widest_line_px={} total_h={} row_h={} "
+            "team_idx={} stick_y={} start_y={} end_y={}".format(
+                len(rows),
+                _label.bounding_box[2],
+                total_height,
+                row_height,
+                team_index,
+                stick_y,
+                start_y,
+                end_y,
+            )
+        )
+
+    _label.y = start_y
+
+    if stick_y is not None:
+        while _label.y > stick_y:
+            _label.y -= 1
+            time.sleep(SCROLL_FRAME_DELAY)
+        time.sleep(STICK_PAUSE_SECONDS)
+
+    while _label.y > end_y:
+        _label.y -= 1
+        time.sleep(SCROLL_FRAME_DELAY)
+
+    gc.collect()
+
+
+def _set_label_text_line(text):
+    """Like ascii_safe(), but for one row of a vertical-scroll screen -
+    truncated to a per-line budget rather than the whole-label MAX_GLYPHS,
+    since MAX_GLYPHS is sized for a single long horizontal line.
+    """
+    text = ascii_safe(text)
+    return text[:40]
+
+
+def show_screen(screen):
+    if screen["kind"] == "v":
+        show_screen_vertical(screen["rows"], screen["team_index"], screen["color"])
+    else:
+        show_screen_horizontal(screen["text"], screen["color"])
+
+
 def main():
-    screens = [("Connecting...", COLOR_STATUS)]
+    screens = [_h_screen("Connecting...", COLOR_STATUS)]
     have_data = False
     last_fetch = None
 
@@ -288,23 +435,26 @@ def main():
                                 data.get("mode"), len(screens)
                             )
                         )
-                        for screen_text, _ in screens:
-                            print("  ", screen_text)
+                        for screen in screens:
+                            if screen["kind"] == "v":
+                                print("   [v]", screen["rows"])
+                            else:
+                                print("   [h]", screen["text"])
                 except Exception as error:  # pylint: disable=broad-except
                     print("Building screens failed:", error)
-                    screens = [("Data error", COLOR_STATUS)]
+                    screens = [_h_screen("Data error", COLOR_STATUS)]
             elif not have_data:
                 # Never had good data yet - keep showing "Connecting...";
                 # once we do have a good render, a later failed fetch just
                 # holds the last good screens instead of blanking them.
-                screens = [("Connecting...", COLOR_STATUS)]
+                screens = [_h_screen("Connecting...", COLOR_STATUS)]
             data = None  # drop the reference so gc can reclaim it promptly
 
         # Always play the full rotation - no early exit part-way through,
         # so every screen (including headlines, last in the list) reliably
         # gets its turn instead of being cut off by a stale time check.
-        for text, color in screens:
-            show_screen(text, color)
+        for screen in screens:
+            show_screen(screen)
 
 
 main()
