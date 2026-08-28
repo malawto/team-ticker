@@ -35,6 +35,8 @@ from typing import Any, Optional
 
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Reference instance this project was built against — not the only
 # supported team. Override via the TEAM_ID / LEAGUE env vars (see
@@ -173,6 +175,24 @@ def make_session() -> requests.Session:
             "Accept": "application/json",
         }
     )
+
+    # The session (and its pooled connections) is reused for the container's
+    # whole lifetime across cycles up to POLL_INTERVAL_BY_MODE['idle'] apart
+    # (see run_loop) - long enough that a remote server/CDN can close an
+    # idle keep-alive connection before we reuse it. Observed live against
+    # BBC's feed: reliably every other idle cycle (~every 30 min) failed
+    # with RemoteDisconnected, alternating with a fresh connection
+    # succeeding - the signature of a stale pooled connection, not a real
+    # outage. Retrying once on a fresh connection (only for connect/read
+    # errors, not on any actual HTTP status - status_forcelist stays unset
+    # so 4xx/5xx responses are still handled by fetch_json/fetch_text's own
+    # raise_for_status(), not silently retried here) fixes that without
+    # masking real failures.
+    retry = Retry(total=2, backoff_factor=0.5, allowed_methods=frozenset(["GET"]))
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
     return session
 
 

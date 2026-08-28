@@ -13,6 +13,7 @@ from poller import (
     determine_mode,
     full_table_from_standings,
     headlines_from_rss,
+    make_session,
     push_kuma_heartbeat,
     table_slice_from_standings,
 )
@@ -557,6 +558,31 @@ class PushKumaHeartbeatTests(unittest.TestCase):
             )
         except Exception as error:  # pylint: disable=broad-except
             self.fail(f"push_kuma_heartbeat raised unexpectedly: {error}")
+
+
+class MakeSessionTests(unittest.TestCase):
+    """The session is reused across cycles up to 15 minutes apart (see
+    run_loop) - long enough for a remote server to have closed a pooled
+    keep-alive connection, observed live as an intermittent
+    RemoteDisconnected against BBC's feed. Retrying once on a fresh
+    connection fixes that; these just confirm the retry policy is actually
+    wired up on both adapters, not that urllib3's retry mechanics work
+    (that's urllib3's own test suite's job).
+    """
+
+    def test_retries_are_configured_on_both_adapters(self):
+        session = make_session()
+        for scheme in ("https://", "http://"):
+            adapter = session.get_adapter(scheme + "example.com")
+            self.assertGreaterEqual(adapter.max_retries.total, 1)
+
+    def test_does_not_retry_on_http_error_status(self):
+        # status_forcelist must stay unset - fetch_json/fetch_text rely on
+        # raise_for_status() for HTTP-level errors (e.g. a real 404/500),
+        # and retrying those here would just mask/delay that.
+        session = make_session()
+        adapter = session.get_adapter("https://example.com")
+        self.assertFalse(adapter.max_retries.status_forcelist)
 
 
 if __name__ == "__main__":
