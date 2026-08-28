@@ -12,6 +12,7 @@ from poller import (
     build_ticker_document,
     determine_mode,
     headlines_from_rss,
+    push_kuma_heartbeat,
     table_slice_from_standings,
 )
 
@@ -438,6 +439,61 @@ class RunOnceRequestedTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("RUN_ONCE", None)
                 self.assertFalse(_run_once_requested())
+
+
+class PushKumaHeartbeatTests(unittest.TestCase):
+    def test_noop_when_url_unset(self):
+        session = mock.Mock()
+        push_kuma_heartbeat(session, None, "up", "OK")
+        session.get.assert_not_called()
+
+    def test_noop_when_url_empty_string(self):
+        session = mock.Mock()
+        push_kuma_heartbeat(session, "", "up", "OK")
+        session.get.assert_not_called()
+
+    def test_pushes_expected_params_when_configured(self):
+        session = mock.Mock()
+        push_kuma_heartbeat(
+            session, "https://uptime.home/api/push/abc123", "up", "OK"
+        )
+        session.get.assert_called_once_with(
+            "https://uptime.home/api/push/abc123",
+            params={"status": "up", "msg": "OK", "ping": ""},
+            timeout=mock.ANY,
+        )
+
+    def test_pushes_down_status_with_message(self):
+        session = mock.Mock()
+        push_kuma_heartbeat(
+            session,
+            "https://uptime.home/api/push/abc123",
+            "down",
+            "cycle failed: connection refused",
+        )
+        args, kwargs = session.get.call_args
+        self.assertEqual(kwargs["params"]["status"], "down")
+        self.assertEqual(
+            kwargs["params"]["msg"], "cycle failed: connection refused"
+        )
+
+    def test_long_message_is_truncated(self):
+        session = mock.Mock()
+        push_kuma_heartbeat(session, "https://uptime.home/api/push/abc123", "down", "x" * 500)
+        _, kwargs = session.get.call_args
+        self.assertEqual(len(kwargs["params"]["msg"]), 200)
+
+    def test_failed_push_is_swallowed_not_raised(self):
+        import requests
+
+        session = mock.Mock()
+        session.get.side_effect = requests.ConnectionError("Kuma is down")
+        try:
+            push_kuma_heartbeat(
+                session, "https://uptime.home/api/push/abc123", "up", "OK"
+            )
+        except Exception as error:  # pylint: disable=broad-except
+            self.fail(f"push_kuma_heartbeat raised unexpectedly: {error}")
 
 
 if __name__ == "__main__":

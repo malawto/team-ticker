@@ -116,6 +116,7 @@ class Config:
     scoreboard_url: str
     standings_url: str
     ticker_json_path: str
+    kuma_push_url: Optional[str]
 
 
 def load_config() -> Config:
@@ -152,6 +153,10 @@ def load_config() -> Config:
         ticker_json_path=os.environ.get(
             "TICKER_JSON_PATH", DEFAULT_TICKER_JSON_PATH
         ).strip(),
+        # Optional: this is a generic tool, not everyone deploying it uses
+        # Uptime Kuma. Unset -> push_kuma_heartbeat() is a no-op, no error,
+        # no warning spam - this isn't a fail-fast field like TEAM_ID.
+        kuma_push_url=os.environ.get("KUMA_PUSH_URL", "").strip() or None,
     )
 
 
@@ -216,6 +221,29 @@ def fetch_headlines_xml(
     session: requests.Session, headlines_url: str = HEADLINES_URL
 ) -> Optional[str]:
     return fetch_text(session, headlines_url)
+
+
+def push_kuma_heartbeat(
+    session: requests.Session, kuma_push_url: Optional[str], status: str, msg: str
+) -> None:
+    """Push a heartbeat to an Uptime Kuma (or compatible) push monitor.
+
+    No-op if kuma_push_url is unset - KUMA_PUSH_URL is optional, most
+    deployments of this generic tool won't use Uptime Kuma at all. A failed
+    push is logged and swallowed like every other network call in this
+    module: monitoring is secondary and must never be able to take down the
+    primary polling function.
+    """
+    if not kuma_push_url:
+        return
+    try:
+        session.get(
+            kuma_push_url,
+            params={"status": status, "msg": msg[:200], "ping": ""},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        log.error("Kuma heartbeat push failed: %s", exc)
 
 
 def fetch_upcoming_scoreboard(
@@ -655,12 +683,16 @@ def run_loop() -> None:
     while not _shutdown_event.is_set():
         try:
             document = run_once(session, config)
-        except Exception:
+        except Exception as exc:
             log.exception("cycle failed unexpectedly; retrying in %ss", backoff)
+            push_kuma_heartbeat(
+                session, config.kuma_push_url, "down", f"cycle failed: {exc}"
+            )
             _shutdown_event.wait(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
             continue
 
+        push_kuma_heartbeat(session, config.kuma_push_url, "up", "OK")
         backoff = INITIAL_BACKOFF_SECONDS
         interval = POLL_INTERVAL_BY_MODE.get(document["mode"], POLL_INTERVAL_IDLE)
         log.info("next cycle in %ss (mode=%s)", interval, document["mode"])
