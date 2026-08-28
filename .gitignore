@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 ticker.json
 firmware/secrets.py
+extra-ca-certs/*
+!extra-ca-certs/.gitkeep
