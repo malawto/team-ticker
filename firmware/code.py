@@ -8,6 +8,8 @@ live, amber for matchday, red for idle.
 
 Requires secrets.py on the CIRCUITPY drive (see secrets.py.example) with a
 `secrets` dict containing "ssid", "password", and "ticker_url".
+Optionally "utc_offset_minutes" and "timezone_label" to also show kickoff
+times converted to local time alongside UTC.
 """
 
 import gc
@@ -25,6 +27,11 @@ except ImportError:
     raise
 
 TICKER_URL = secrets["ticker_url"]
+# Both optional - see format_kickoff. In minutes, not hours, so real-world
+# fractional-hour timezones (e.g. India UTC+5:30, Newfoundland UTC-3:30)
+# are representable exactly rather than rounded.
+UTC_OFFSET_MINUTES = secrets.get("utc_offset_minutes", 0)
+TIMEZONE_LABEL = secrets.get("timezone_label", "local")
 
 FETCH_INTERVAL = 60  # seconds between polls of the backend
 SCROLL_FRAME_DELAY = 0.02  # seconds per scroll pixel-step
@@ -145,17 +152,36 @@ def ascii_safe(text):
 
 
 def format_kickoff(iso_utc):
-    """"2026-08-29T11:30Z" -> "08-29 11:30 UTC". No timezone conversion —
-    CircuitPython has no zoneinfo, so this stays in UTC rather than
-    silently showing the wrong local time.
+    """"2026-08-29T11:30Z" -> "08-29 11:30 UTC" (UTC_OFFSET_MINUTES unset/0)
+    or "08-29 11:30 UTC  07:30 EDT" (configured). CircuitPython has no
+    zoneinfo/full datetime arithmetic, so this only converts the clock time
+    (hour:minute, wrapping within a day) via plain integer arithmetic - it
+    deliberately doesn't attempt to roll the displayed date across a
+    midnight boundary that a large offset might cross, since that needs
+    real calendar math this board has no library for. The UTC date+time
+    shown alongside stays the authoritative, unambiguous value either way.
     """
     if not iso_utc:
         return "TBD"
     try:
         date_part, time_part = iso_utc.split("T")
-        return "{} {} UTC".format(date_part[5:], time_part.rstrip("Z")[:5])
+        hour_str, minute_str = time_part.rstrip("Z")[:5].split(":")
+        utc_hour = int(hour_str)
+        utc_minute = int(minute_str)
     except (ValueError, IndexError):
         return iso_utc
+
+    utc_display = "{} {:02d}:{:02d} UTC".format(date_part[5:], utc_hour, utc_minute)
+
+    if not UTC_OFFSET_MINUTES:
+        return utc_display
+
+    local_total_minutes = (utc_hour * 60 + utc_minute + UTC_OFFSET_MINUTES) % 1440
+    local_hour = local_total_minutes // 60
+    local_minute = local_total_minutes % 60
+    return "{}  {:02d}:{:02d} {}".format(
+        utc_display, local_hour, local_minute, TIMEZONE_LABEL
+    )
 
 
 def fetch_ticker():
