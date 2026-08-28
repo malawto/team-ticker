@@ -305,6 +305,13 @@ def show_screen_horizontal(text, color):
     """Scroll a single line right-to-left across the panel."""
     gc.collect()  # max headroom before the longest strings (headlines)
 
+    # Hidden for the whole setup: .text assignment renders immediately at
+    # whatever position the label is currently sitting at (leftover from
+    # the previous screen), and that briefly-visible stale-position render
+    # is exactly the "created before the scroll begins" flash - hiding
+    # until it's positioned at the correct off-screen start point means
+    # that intermediate render never reaches the panel at all.
+    _label.hidden = True
     _label.color = color
     _set_label_text(text)
     # A vertical screen may have left .y off in the weeds (see
@@ -316,6 +323,8 @@ def show_screen_horizontal(text, color):
     display_width = matrixportal.display.width
     line_width = _label.bounding_box[2]
     _label.x = display_width
+    _label.hidden = False
+
     while _label.x > -line_width:
         _label.x -= 1
         time.sleep(SCROLL_FRAME_DELAY)
@@ -338,6 +347,10 @@ def show_screen_vertical(rows, team_index, color):
     """
     gc.collect()
 
+    # See show_screen_horizontal for why: hidden until positioned at the
+    # correct off-screen start point, so the "created before the scroll
+    # begins" flash never reaches the panel.
+    _label.hidden = True
     sanitized = [_set_label_text_line(row) for row in rows]
     _label.color = color
     _label.x = 0
@@ -346,6 +359,7 @@ def show_screen_vertical(rows, team_index, color):
     display_height = matrixportal.display.height
     total_height = _label.bounding_box[3]
     if total_height <= 0 or not rows:
+        _label.hidden = False
         return
 
     row_height = total_height / len(rows)
@@ -374,6 +388,7 @@ def show_screen_vertical(rows, team_index, color):
         )
 
     _label.y = start_y
+    _label.hidden = False
 
     if stick_y is not None:
         while _label.y > stick_y:
