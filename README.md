@@ -39,13 +39,14 @@ Set via `backend/.env` (copy from `backend/.env.example`):
 |---|---|---|---|
 | `TEAM_ID` | No | `364` (Liverpool FC) | ESPN's numeric team id. Find it by opening `https://site.api.espn.com/apis/site/v2/sports/soccer/<LEAGUE>/scoreboard` and reading a competitor's `team.id`. |
 | `LEAGUE` | No | `eng.1` | ESPN's league slug. |
+| `LOCAL_TZ` | No | `UTC` | IANA timezone name (e.g. `America/New_York`) `matchday` is judged against — a fixture is `matchday` when its kickoff falls on today's calendar date *in this timezone*, not UTC's. |
 | `PUID` / `PGID` | No | `1000` / `1000` | UID/GID the container runs as — must match the host user that owns the bind-mounted `data/` directory. Check with `id <your-user>`. |
 | `TICKER_JSON_PATH` | No (container-internal) | `/data/ticker.json` | Set in the Dockerfile, not `.env` — where `ticker.json` is written inside the container. Only relevant if you change the Dockerfile/compose volume layout. |
 | `KUMA_PUSH_URL` | No | unset | Push-monitor URL (Uptime Kuma or compatible). See **Monitoring** below. |
 
-`TEAM_ID`/`LEAGUE` fail fast (the poller logs and exits) if set to something
-that isn't a plausible id/slug — better than silently polling the wrong
-team forever.
+`TEAM_ID`/`LEAGUE`/`LOCAL_TZ` fail fast (the poller logs and exits) if set to
+something that isn't a plausible id/slug/IANA timezone name — better than
+silently polling the wrong team, or misjudging "matchday", forever.
 
 ## Backend setup
 

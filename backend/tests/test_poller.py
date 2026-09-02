@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from poller import (
@@ -106,7 +106,8 @@ class DetermineModeTests(unittest.TestCase):
             "pre", None, None, home_away="away", opponent=MAN_CITY,
             date="2026-08-27T16:30Z",
         )
-        result = determine_mode(_scoreboard_with(competition))
+        now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
+        result = determine_mode(_scoreboard_with(competition), now=now)
 
         self.assertEqual(result["mode"], "matchday")
         matchday = result["matchday"]
@@ -118,14 +119,91 @@ class DetermineModeTests(unittest.TestCase):
     def test_matchday_finished(self):
         competition = _competition(
             "post", 3, 0, home_away="home", opponent=ARSENAL,
+            date="2026-08-27T19:00Z",
         )
-        result = determine_mode(_scoreboard_with(competition))
+        now = datetime(2026, 8, 27, 21, 0, tzinfo=timezone.utc)
+        result = determine_mode(_scoreboard_with(competition), now=now)
 
         self.assertEqual(result["mode"], "matchday")
         matchday = result["matchday"]
         self.assertEqual(matchday["opponent"], "Arsenal")
         self.assertEqual(matchday["final_score"], {"team": 3, "opponent": 0})
         self.assertNotIn("kickoff_utc", matchday)
+
+    def test_pre_match_not_on_today_falls_back_to_idle(self):
+        # ESPN's scoreboard response covers the whole current matchweek, not
+        # literally "today" — a fixture several days out shouldn't count as
+        # matchday yet.
+        competition = _competition(
+            "pre", None, None, home_away="away", opponent=MAN_CITY,
+            date="2026-08-30T16:30Z",
+        )
+        now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
+        result = determine_mode(_scoreboard_with(competition), now=now)
+
+        self.assertEqual(result["mode"], "idle")
+
+    def test_post_match_from_a_previous_day_falls_back_to_idle(self):
+        competition = _competition(
+            "post", 3, 0, home_away="home", opponent=ARSENAL,
+            date="2026-08-25T19:00Z",
+        )
+        now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
+        result = determine_mode(_scoreboard_with(competition), now=now)
+
+        self.assertEqual(result["mode"], "idle")
+
+    def test_matchday_uses_local_tz_not_utc_for_the_date_boundary(self):
+        # Kickoff is 2026-08-28T01:00Z — the day after `now` in UTC — but in
+        # a viewer 5 hours behind UTC it's still 2026-08-27 20:00 local,
+        # same calendar day as `now`. Should count as matchday.
+        competition = _competition(
+            "pre", None, None, home_away="home", opponent=MAN_CITY,
+            date="2026-08-28T01:00Z",
+        )
+        now = datetime(2026, 8, 27, 15, 0, tzinfo=timezone.utc)
+        local_tz = timezone(timedelta(hours=-5))
+
+        utc_result = determine_mode(_scoreboard_with(competition), now=now)
+        self.assertEqual(utc_result["mode"], "idle")
+
+        local_result = determine_mode(
+            _scoreboard_with(competition), now=now, local_tz=local_tz
+        )
+        self.assertEqual(local_result["mode"], "matchday")
+
+    def test_matchday_local_tz_can_also_rule_out_a_utc_same_day_match(self):
+        # Kickoff is 2026-08-27T02:00Z, same UTC calendar date as `now`
+        # (2026-08-27T20:00Z) — a UTC-only check would call this matchday.
+        # But 5 hours behind UTC, kickoff lands at 2026-08-26 21:00 local —
+        # yesterday relative to `now`'s local date (2026-08-27 15:00). Should
+        # not count as matchday yet.
+        competition = _competition(
+            "pre", None, None, home_away="home", opponent=MAN_CITY,
+            date="2026-08-27T02:00Z",
+        )
+        now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+        local_tz = timezone(timedelta(hours=-5))
+
+        utc_result = determine_mode(_scoreboard_with(competition), now=now)
+        self.assertEqual(utc_result["mode"], "matchday")
+
+        local_result = determine_mode(
+            _scoreboard_with(competition), now=now, local_tz=local_tz
+        )
+        self.assertEqual(local_result["mode"], "idle")
+
+    def test_live_match_counts_as_matchday_regardless_of_date_edge_cases(self):
+        # A genuinely live match should never be demoted to idle by the date
+        # check, even for a near-midnight kickoff.
+        competition = _competition(
+            "in", 1, 0, home_away="home", opponent=EVERTON,
+            date="2026-08-27T23:45Z", display_clock="90+2'", period=2,
+        )
+        now = datetime(2026, 8, 28, 0, 5, tzinfo=timezone.utc)
+        result = determine_mode(_scoreboard_with(competition), now=now)
+
+        self.assertEqual(result["mode"], "live")
 
     def test_idle_with_next_fixture(self):
         scoreboard = {"events": []}

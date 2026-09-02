@@ -32,6 +32,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from dotenv import load_dotenv
@@ -43,6 +44,12 @@ from urllib3.util.retry import Retry
 # .env.example).
 DEFAULT_TEAM_ID = "364"  # Liverpool FC
 DEFAULT_LEAGUE = "eng.1"  # English Premier League
+
+# "matchday" is judged against the calendar date in this timezone, not UTC —
+# a fixture ESPN timestamps as, say, 2026-08-28T01:00Z is still "today" to a
+# viewer several hours behind UTC. Defaults to UTC (i.e. today's prior
+# behavior) so this is opt-in via LOCAL_TZ, not assumed for every deployment.
+DEFAULT_LOCAL_TZ = "UTC"
 
 SCOREBOARD_URL_TEMPLATE = (
     "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -119,6 +126,7 @@ class Config:
     standings_url: str
     ticker_json_path: str
     kuma_push_url: Optional[str]
+    local_tz: ZoneInfo
 
 
 def load_config() -> Config:
@@ -131,6 +139,7 @@ def load_config() -> Config:
 
     team_id = os.environ.get("TEAM_ID", DEFAULT_TEAM_ID).strip()
     league = os.environ.get("LEAGUE", DEFAULT_LEAGUE).strip()
+    local_tz_name = os.environ.get("LOCAL_TZ", DEFAULT_LOCAL_TZ).strip()
 
     if not team_id or not team_id.isdigit():
         log.error(
@@ -147,6 +156,18 @@ def load_config() -> Config:
         )
         sys.exit(1)
 
+    try:
+        local_tz = ZoneInfo(local_tz_name) if local_tz_name else ZoneInfo(
+            DEFAULT_LOCAL_TZ
+        )
+    except (ZoneInfoNotFoundError, ValueError):
+        log.error(
+            "LOCAL_TZ is unset or invalid (%r) — set LOCAL_TZ in your .env "
+            "to an IANA timezone name (e.g. America/New_York).",
+            local_tz_name,
+        )
+        sys.exit(1)
+
     return Config(
         team_id=team_id,
         league=league,
@@ -159,6 +180,7 @@ def load_config() -> Config:
         # Uptime Kuma. Unset -> push_kuma_heartbeat() is a no-op, no error,
         # no warning spam - this isn't a fail-fast field like TEAM_ID.
         kuma_push_url=os.environ.get("KUMA_PUSH_URL", "").strip() or None,
+        local_tz=local_tz,
     )
 
 
@@ -587,6 +609,18 @@ def headlines_from_rss(
     return (team_titles + other_titles)[:limit]
 
 
+def _is_on_date(date_str: Optional[str], now: datetime, local_tz: Any) -> bool:
+    """True if `date_str` (an ESPN ISO8601 UTC timestamp) falls on the same
+    calendar date as `now` when both are viewed in `local_tz`."""
+    if not date_str:
+        return False
+    try:
+        date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return date.astimezone(local_tz).date() == now.astimezone(local_tz).date()
+
+
 def determine_mode(
     scoreboard_data: Optional[dict],
     upcoming_scoreboard_data: Optional[dict] = None,
@@ -594,6 +628,7 @@ def determine_mode(
     headlines_xml: Optional[str] = None,
     team_id: str = DEFAULT_TEAM_ID,
     now: Optional[datetime] = None,
+    local_tz: Any = timezone.utc,
 ) -> dict:
     """Pure mode-detection entry point.
 
@@ -607,14 +642,28 @@ def determine_mode(
     provided, are only consulted for idle mode's next_fixture/table/
     headlines respectively — see fetch_upcoming_scoreboard, fetch_standings,
     and fetch_headlines_xml.
+
+    ESPN's scoreboard response (with no `dates` param) covers the current
+    matchweek, not literally "today" — it can include a team's fixture days
+    before or after now. "matchday" is reserved for a fixture that's actually
+    on today's calendar date in `local_tz` (or already live); anything else
+    found in that response is treated as not-yet-relevant and falls through
+    to idle. `local_tz` defaults to UTC — pass the configured viewer timezone
+    (see Config.local_tz) to judge "today" the way a person actually would.
     """
     now = now or datetime.now(timezone.utc)
 
     competition = find_team_competition(scoreboard_data or {}, team_id)
     if competition is not None:
-        return classify_competition(competition, team_id)
+        status_state = (
+            (competition.get("status") or {}).get("type") or {}
+        ).get("state", "pre")
+        if status_state == "in" or _is_on_date(
+            competition.get("date"), now, local_tz
+        ):
+            return classify_competition(competition, team_id)
 
-    log.info("no match found for team %s in scoreboard; falling back to idle", team_id)
+    log.info("no match today for team %s; falling back to idle", team_id)
 
     table = table_slice_from_standings(standings_data, team_id)
     team_row = next((row for row in table if row.get("is_team")), None)
@@ -680,7 +729,9 @@ def run_once(session: requests.Session, config: Config) -> dict:
     """A single fetch-detect-write cycle."""
     scoreboard_data = fetch_scoreboard(session, config.scoreboard_url)
 
-    mode_result = determine_mode(scoreboard_data, team_id=config.team_id)
+    mode_result = determine_mode(
+        scoreboard_data, team_id=config.team_id, local_tz=config.local_tz
+    )
 
     # Only bother fetching next-fixture/table/headlines data if we actually
     # landed on idle mode.
@@ -694,6 +745,7 @@ def run_once(session: requests.Session, config: Config) -> dict:
             standings_data=standings_data,
             headlines_xml=headlines_xml,
             team_id=config.team_id,
+            local_tz=config.local_tz,
         )
 
     log.info("mode determined: %s", mode_result["mode"])
