@@ -5,11 +5,14 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/mikelawton/team-ticker-view/internal/config"
 	"github.com/mikelawton/team-ticker-view/internal/ticker"
 	"github.com/mikelawton/team-ticker-view/internal/ui"
 )
@@ -18,7 +21,8 @@ const version = "0.1.0"
 
 func main() {
 	var (
-		url     = flag.String("url", os.Getenv("TICKER_URL"), "URL of ticker.json (or set TICKER_URL)")
+		urlFlag = flag.String("url", "", "URL of ticker.json — overrides any saved setting, just for this run")
+		setURL  = flag.String("set-url", "", "save this URL as the default and exit (no fetch)")
 		timeout = flag.Duration("timeout", 5*time.Second, "HTTP request timeout")
 		showVer = flag.Bool("version", false, "print version and exit")
 	)
@@ -29,17 +33,73 @@ func main() {
 		return
 	}
 
-	if *url == "" {
-		fmt.Fprintln(os.Stderr, "team-ticker-view: no ticker.json URL given — pass -url or set TICKER_URL")
-		fmt.Fprintln(os.Stderr, "  e.g. team-ticker-view -url http://lfc-ticker.home/ticker.json")
+	if *setURL != "" {
+		if err := config.SaveURL(*setURL); err != nil {
+			fmt.Fprintln(os.Stderr, "team-ticker-view:", err)
+			os.Exit(1)
+		}
+		path, _ := config.Path()
+		fmt.Printf("Saved %s to %s\n", *setURL, path)
+		return
+	}
+
+	url, err := resolveURL(*urlFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "team-ticker-view:", err)
 		os.Exit(1)
 	}
 
-	doc, err := ticker.Fetch(*url, *timeout)
+	doc, err := ticker.Fetch(url, *timeout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "team-ticker-view:", err)
 		os.Exit(1)
 	}
 
 	fmt.Print(ui.Render(doc))
+}
+
+// resolveURL picks the ticker.json URL in order: the -url flag, then
+// TICKER_URL in the environment, then the saved setting
+// (~/.config/team-ticker-view/env). If none of those are set, it prompts
+// once on stdin and saves the answer via config.SaveURL so future runs
+// don't need to repeat it — mirrors nyt-term's first-run API key prompt.
+func resolveURL(flagURL string) (string, error) {
+	if flagURL != "" {
+		return flagURL, nil
+	}
+	if envURL := os.Getenv("TICKER_URL"); envURL != "" {
+		return envURL, nil
+	}
+
+	savedURL, err := config.LoadURL()
+	if err != nil {
+		return "", err
+	}
+	if savedURL != "" {
+		return savedURL, nil
+	}
+
+	return promptForURL()
+}
+
+func promptForURL() (string, error) {
+	fmt.Fprint(os.Stderr, "No ticker.json URL configured.\nEnter one now (e.g. http://lfc-ticker.home/ticker.json): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading URL from stdin: %w", err)
+	}
+	url := strings.TrimSpace(input)
+	if url == "" {
+		return "", fmt.Errorf("no URL given — pass -url, set TICKER_URL, or run with -set-url <url>")
+	}
+
+	if err := config.SaveURL(url); err != nil {
+		return "", err
+	}
+	path, _ := config.Path()
+	fmt.Fprintf(os.Stderr, "Saved to %s — future runs won't ask again.\n\n", path)
+
+	return url, nil
 }

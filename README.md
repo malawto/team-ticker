@@ -309,9 +309,15 @@ table (`full_table`), not just the ±2-team window (`table`).
 ```sh
 cd tui
 go build -o team-ticker-view .
-./team-ticker-view -url http://lfc-ticker.home/ticker.json
-# or: export TICKER_URL=http://lfc-ticker.home/ticker.json && ./team-ticker-view
+./team-ticker-view -set-url http://lfc-ticker.home/ticker.json   # save it once...
+./team-ticker-view                                               # ...then just run it
 ```
+
+The URL is resolved in this order: the `-url` flag (a one-off override,
+not saved), then the `TICKER_URL` environment variable, then the saved
+setting at `~/.config/team-ticker-view/env`. If none of those are set,
+it prompts once on stdin and saves your answer for next time — same
+first-run convention as nyt-term's API key prompt.
 
 Run it again (alias it, or wrap it in `watch -n 60 ...`) whenever you want
 a fresh look — it doesn't poll on its own. The footer's "updated Xm ago"
