@@ -306,6 +306,12 @@ matrix display, not an interactive TUI. It has none of the LED matrix's
 memory constraints, so unlike the firmware it renders the *full* league
 table (`full_table`), not just the ±2-team window (`table`).
 
+### Installing
+
+Requires Go 1.24+ to build.
+
+#### Option 1: build and run directly
+
 ```sh
 cd tui
 go build -o team-ticker-view .
@@ -313,11 +319,27 @@ go build -o team-ticker-view .
 ./team-ticker-view                                               # ...then just run it
 ```
 
+#### Option 2: build a `.deb` package (system-wide)
+
+```sh
+cd tui
+./build-deb.sh
+sudo apt install ./team-ticker-view_0.1.0_amd64.deb
+```
+
+Installs `team-ticker-view` to `/usr/bin` for all users on the machine.
+Unlike nyt-term's `build-deb.sh`, this doesn't install a desktop
+entry/icon — the tool prints one page and exits, so there's no
+persistent app window for a launcher to point at.
+
+### Usage
+
 The URL is resolved in this order: the `-url` flag (a one-off override,
 not saved), then the `TICKER_URL` environment variable, then the saved
 setting at `~/.config/team-ticker-view/env`. If none of those are set,
 it prompts once on stdin and saves your answer for next time — same
-first-run convention as nyt-term's API key prompt.
+first-run convention as nyt-term's API key prompt. `-set-url <url>` saves
+without fetching, for scripted setup.
 
 Run it again (alias it, or wrap it in `watch -n 60 ...`) whenever you want
 a fresh look — it doesn't poll on its own. The footer's "updated Xm ago"
@@ -342,6 +364,8 @@ sudo systemctl restart systemd-resolved      # flush-caches alone did not clear
                                               # restart did.
 resolvectl query lfc-ticker.home             # should now return an address
 ```
+
+### Development
 
 ```sh
 cd tui
