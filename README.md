@@ -18,17 +18,21 @@ poller.py (Docker container, polls every 60s-15m)
             - plain HTTP, no redirect — for the Matrix Portal, which can't
               install a custom CA on its ESP32 co-processor
                 -> Matrix Portal M4 polls the HTTP copy and renders it
+                -> tui/'s team-ticker-view polls the same HTTP copy and
+                   prints a formatted snapshot to a terminal
 ```
 
-The backend and firmware never talk to each other directly — `ticker.json`
-on disk is the entire interface. Nothing else about the display (WiFi,
-polling, rendering) depends on how that file got there.
+The backend and its consumers never talk to each other directly —
+`ticker.json` on disk is the entire interface. Nothing about a given
+display (WiFi, polling, rendering) depends on how that file got there, or
+on what else is reading it.
 
 ## Repository layout
 
 ```
 backend/     Docker container + poller.py — fetches data, writes ticker.json
 firmware/    CircuitPython code for the Matrix Portal display
+tui/         Go CLI — prints a formatted single-page snapshot of ticker.json
 ```
 
 ## Configuration reference
@@ -292,6 +296,53 @@ work. Root cause unconfirmed (untested whether it's a Linux/Windows driver
 difference or just needed a power cycle at the time). Flashing from a
 Windows machine worked without issue. Don't spend time re-discovering
 this — just use a different machine.
+
+## Terminal client (`tui/`)
+
+`team-ticker-view` is a small Go CLI that fetches `ticker.json` from a
+running backend (the same plain-HTTP URL the Matrix Portal polls) and
+prints one formatted page to stdout — a terminal equivalent of the LED
+matrix display, not an interactive TUI. It has none of the LED matrix's
+memory constraints, so unlike the firmware it renders the *full* league
+table (`full_table`), not just the ±2-team window (`table`).
+
+```sh
+cd tui
+go build -o team-ticker-view .
+./team-ticker-view -url http://lfc-ticker.home/ticker.json
+# or: export TICKER_URL=http://lfc-ticker.home/ticker.json && ./team-ticker-view
+```
+
+Run it again (alias it, or wrap it in `watch -n 60 ...`) whenever you want
+a fresh look — it doesn't poll on its own. The footer's "updated Xm ago"
+line turns into a warning once `generated_at` is older than 35 minutes,
+since the backend's own slowest poll interval is 15 minutes (idle mode) —
+see `POLL_INTERVAL_BY_MODE` in `poller.py` — so anything well past that
+means the poller likely isn't running, not just between cycles.
+
+**If `lfc-ticker.home` (or your equivalent `.home` hostname) fails to
+resolve** with `dial tcp: lookup ... no such host` even though
+`resolvectl status` lists your Pi-hole (or other LAN DNS) as one of the
+link's servers: systemd-resolved doesn't know that server is authoritative
+for `.home` and falls back to a public resolver, which returns NXDOMAIN.
+Fix by adding a routing-only domain and clearing the resulting negative
+cache entry:
+
+```sh
+sudo resolvectl domain <interface> '~home'   # e.g. enp4s0 — see `resolvectl status`
+sudo systemctl restart systemd-resolved      # flush-caches alone did not clear
+                                              # the stale NXDOMAIN on the machine
+                                              # this was first hit on; a full
+                                              # restart did.
+resolvectl query lfc-ticker.home             # should now return an address
+```
+
+```sh
+cd tui
+go build ./...
+go vet ./...
+go test ./...
+```
 
 ## Monitoring
 
